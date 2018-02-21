@@ -1,3 +1,6 @@
+// UAC: require administrator
+1 24 "openconnect.exe.manifest"
+
 // application icon
 IDI_ICON1       ICON    DISCARDABLE     "openconnect.ico"
 
