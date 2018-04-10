@@ -29,6 +29,8 @@ extern "C" {
 #endif
 
 #ifdef _WIN32
+#include <winsock2.h>
+
 #define uid_t unsigned
 #endif
 

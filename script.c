@@ -24,6 +24,8 @@
 #include <unistd.h>
 #ifndef _WIN32
 #include <sys/wait.h>
+#else
+#include <stdbool.h>
 #endif
 #include <errno.h>
 #include <ctype.h>
@@ -31,6 +33,15 @@
 #include <stdlib.h>
 
 #include "openconnect-internal.h"
+
+#ifdef _WIN32
+#define BUFSIZE 4096
+
+HANDLE g_hChildStd_OUT_Rd = NULL;
+HANDLE g_hChildStd_OUT_Wr = NULL;
+HANDLE g_hChildStd_ERR_Rd = NULL;
+HANDLE g_hChildStd_ERR_Wr = NULL;
+#endif
 
 int script_setenv(struct openconnect_info *vpninfo,
 		  const char *opt, const char *val, int trunc, int append)
@@ -496,17 +507,52 @@ int script_config_tun(struct openconnect_info *vpninfo, const char *reason)
 	int ret;
 	char *cmd;
 	PROCESS_INFORMATION pi;
+	SECURITY_ATTRIBUTES sa;
 	STARTUPINFOW si;
 	DWORD cpflags;
+
+	DWORD dwRead = 0;
+	CHAR chBuf[BUFSIZE];
+	bool bSuccess = FALSE;
+	char* token = NULL;
 
 	if (!vpninfo->vpnc_script || vpninfo->script_tun)
 		return 0;
 
-	memset(&si, 0, sizeof(si));
-	si.cb = sizeof(si);
+	// Set the bInheritHandle flag so pipe handles are inherited.
+	sa.nLength = sizeof(SECURITY_ATTRIBUTES);
+	sa.bInheritHandle = TRUE;
+	sa.lpSecurityDescriptor = NULL;
+	// Create a pipe for the child process's STDERR.
+	if (!CreatePipe(&g_hChildStd_ERR_Rd, &g_hChildStd_ERR_Wr, &sa, 0)) {
+		return -EPIPE;
+	}
+	// Ensure the read handle to the pipe for STDERR is not inherited.
+	if (!SetHandleInformation(g_hChildStd_ERR_Rd, HANDLE_FLAG_INHERIT, 0)) {
+		return -EPIPE;
+	}
+	// Create a pipe for the child process's STDOUT.
+	if (!CreatePipe(&g_hChildStd_OUT_Rd, &g_hChildStd_OUT_Wr, &sa, 0)) {
+		return -EPIPE;
+	}
+	// Ensure the read handle to the pipe for STDOUT is not inherited
+	if (!SetHandleInformation(g_hChildStd_OUT_Rd, HANDLE_FLAG_INHERIT, 0)) {
+		return -EPIPE;
+	}
+
+	// Set up members of the PROCESS_INFORMATION structure.
+	ZeroMemory(&pi, sizeof(PROCESS_INFORMATION));
+
+	// Set up members of the STARTUPINFO structure.
+	// This structure specifies the STDERR and STDOUT handles for redirection.
+	ZeroMemory(&si, sizeof(STARTUPINFO));
+	si.cb = sizeof(STARTUPINFO);
 	/* probably superfluous */
-	si.dwFlags = STARTF_USESHOWWINDOW;
+	si.dwFlags |= STARTF_USESHOWWINDOW;
+	si.dwFlags |= STARTF_USESTDHANDLES;
 	si.wShowWindow = SW_HIDE;
+	si.hStdError = g_hChildStd_ERR_Wr;
+	si.hStdOutput = g_hChildStd_OUT_Wr;
 
 	script_setenv(vpninfo, "reason", reason, 0, 0);
 
@@ -532,17 +578,51 @@ int script_config_tun(struct openconnect_info *vpninfo, const char *reason)
 	if (!GetConsoleWindow())
 		cpflags |= CREATE_NO_WINDOW;
 
-	if (CreateProcessW(NULL, script_w, NULL, NULL, FALSE, cpflags,
-			   script_env, NULL, &si, &pi)) {
-		ret = WaitForSingleObject(pi.hProcess,10000);
-		CloseHandle(pi.hThread);
-		CloseHandle(pi.hProcess);
-		if (ret == WAIT_TIMEOUT)
-			ret = -ETIMEDOUT;
-		else
-			ret = 0;
+	if (CreateProcessW(NULL,
+		script_w, // command line
+		NULL, // process security attributes
+		NULL, // primary thread security attributes
+		TRUE, // handles are inherited
+		cpflags, // creation flags
+		script_env, // use parent's environment
+		NULL, // use parent's current directory
+		&si, // STARTUPINFO pointer
+		&pi) // receives PROCESS_INFORMATION
+        ) {
+		CloseHandle(g_hChildStd_ERR_Wr);
+		CloseHandle(g_hChildStd_OUT_Wr);
+		ret = 0;
 	} else {
 		ret = -EIO;
+	}
+
+	// Read from pipe that is the standard output for child process.
+	for (;;) {
+		bSuccess = ReadFile(g_hChildStd_OUT_Rd, chBuf, BUFSIZE, &dwRead, NULL);
+		if (!bSuccess || dwRead == 0) break;
+
+		chBuf[dwRead] = 0;
+		token = strtok(chBuf, "\r\n");
+		while (token) {
+			vpn_progress(vpninfo, PRG_INFO,
+						 _("vpnc: %s\n"),
+						 token);
+			token = strtok(NULL, "\r\n");
+		}
+	}
+	dwRead = 0;
+	for (;;) {
+		bSuccess = ReadFile(g_hChildStd_ERR_Rd, chBuf, BUFSIZE, &dwRead, NULL);
+		if (!bSuccess || dwRead == 0) break;
+
+		chBuf[dwRead] = 0;
+		token = strtok(chBuf, "\r\n");
+		while (token) {
+			vpn_progress(vpninfo, PRG_ERR,
+						 _("vpnc: %s\n"),
+						 token);
+			token = strtok(NULL, "\r\n");
+		}
 	}
 
 	free(script_env);
